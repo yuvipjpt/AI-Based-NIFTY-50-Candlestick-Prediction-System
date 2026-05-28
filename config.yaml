@@ -1,0 +1,58 @@
+data:
+  symbol: "^NSEI"                  # NIFTY 50 Index symbol on yfinance
+  timeframes: ["1m", "5m", "15m", "1h", "1d"]
+  default_timeframe: "1d"
+  cache_dir: "./data"
+  seq_len: 30                      # Number of past candles the LSTM model will look at
+  predict_ahead: 1                 # Predict next candle
+  train_split: 0.8                 # Train-validation split ratio
+  use_custom_dataset: false        # Set to true to use nifty_5year_complete_dataset.csv, false to download from yfinance
+
+indicators:
+  rsi:
+    length: 14
+  macd:
+    fast: 12
+    slow: 26
+    signal: 9
+  ema:
+    lengths: [8, 21, 50, 200]
+  sma:
+    lengths: [20]
+  bollinger:
+    length: 20
+    std: 2
+  atr:
+    length: 14
+
+model:
+  lstm:
+    input_size: 35                 # Will be dynamically updated based on calculated features
+    hidden_dim: 32
+    num_layers: 1
+    dropout: 0.4
+  cnn:
+    backbone: "custom"             # Image size is 224x224
+    pretrained: true
+    feature_dim: 128
+  fusion:
+    hidden_dim: 64
+    dropout: 0.5
+  training:
+    epochs: 35                    # Set to 35 for CPU convergence within agent time limits
+    batch_size: 256
+    learning_rate: 0.001
+    weight_decay: 0.01
+    save_dir: "./models"
+    checkpoint_dir: "./checkpoints"
+
+backtest:
+  initial_capital: 100000.0
+  risk_reward_ratio: 2.0           # 1:2 Risk to Reward
+  atr_multiplier_sl: 1.5           # SL is entry - 1.5 * ATR
+  atr_multiplier_target: 3.0       # Target is entry + 3 * ATR
+
+system:
+  device: "auto"                   # auto, cuda, or cpu
+  log_dir: "./logs"
+  feedback_dir: "./data/feedback"  # Directory to save screenshots and feedback for continuous learning

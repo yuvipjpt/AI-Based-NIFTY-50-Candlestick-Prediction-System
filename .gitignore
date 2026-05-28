@@ -1,0 +1,21 @@
+# Byte-compiled / optimized / DLL archive folder
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch weights and checkpoints
+checkpoints/
+models/*.pt
+models/*.pkl
+models/*.png
+models/*.txt
+
+# Large CSV Data cached from yfinance
+data/*.csv
+data/feedback/
+
+# Logs
+logs/
+*.log
+*.png
+*.txt
