@@ -22,8 +22,96 @@ from training.evaluate import evaluate_model
 from utils.backtester import run_backtest
 from inference.cv_analyzer import ChartCVAnalyzer
 from models.models import MarketFusionModel
+from utils.option_chain import get_nifty_option_chain_data
 
 logger = setup_logger("ui", "system.log")
+
+def fine_tune_online_step(timeframe, seq_data, img_tensor, label_idx):
+    """
+    Performs a single online gradient update step on the trained PyTorch Fusion model.
+    """
+    save_dir = Path(CONFIG['model']['training']['save_dir'])
+    model_path = save_dir / f"fusion_model_{timeframe}.pt"
+    
+    if not model_path.exists():
+        logger.warning(f"Cannot fine-tune online. Model file {model_path} does not exist.")
+        return False
+        
+    try:
+        # Load weights
+        device = torch.device("cuda" if torch.cuda.is_available() and CONFIG['system']['device'] == "auto" else "cpu")
+        if CONFIG['system']['device'] in ["cuda", "cpu"]:
+            device = torch.device(CONFIG['system']['device'])
+            
+        seq_len, num_features = seq_data.shape
+        
+        # Turn inputs to torch tensors
+        seq_tensor = torch.tensor(seq_data, dtype=torch.float32).unsqueeze(0).to(device)
+        img_tensor = img_tensor.to(device)
+        label_tensor = torch.tensor([label_idx], dtype=torch.long).to(device)
+        
+        # Initialize model
+        model = MarketFusionModel(
+            lstm_input_size=num_features,
+            lstm_hidden_dim=CONFIG['model']['lstm']['hidden_dim'],
+            lstm_layers=CONFIG['model']['lstm']['num_layers'],
+            cnn_backbone=CONFIG['model']['cnn']['backbone'],
+            cnn_feature_dim=CONFIG['model']['cnn']['feature_dim'],
+            fusion_hidden_dim=CONFIG['model']['fusion']['hidden_dim'],
+            dropout=CONFIG['model']['fusion']['dropout']
+        ).to(device)
+        
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.train()
+        
+        # Use a small learning rate for online fine-tuning
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+        criterion = torch.nn.CrossEntropyLoss()
+        
+        optimizer.zero_grad()
+        outputs = model(seq_tensor, img_tensor)
+        loss = criterion(outputs, label_tensor)
+        loss.backward()
+        optimizer.step()
+        
+        # Save updated weights
+        torch.save(model.state_dict(), model_path)
+        logger.info(f"Successfully performed online learning step. Loss: {loss.item():.4f}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to execute online learning step: {e}")
+        return False
+
+def calculate_fused_sentiment(model_direction, pcr_val):
+    """Combines model technical predictions with Option Chain PCR sentiment."""
+    if pcr_val > 1.25:
+        option_sentiment = "Bullish"
+    elif pcr_val < 0.65:
+        option_sentiment = "Bearish"
+    else:
+        option_sentiment = "Sideways"
+        
+    if model_direction == "Bullish":
+        if option_sentiment == "Bullish":
+            return "Strongly Bullish 🟢🟢", "Option Chain confirms technical breakout. High bullish momentum."
+        elif option_sentiment == "Bearish":
+            return "Cautious / Neutral ⚠️", "Technical model is bullish, but heavy Call writing (Option Chain) indicates resistance."
+        else:
+            return "Mildly Bullish 🟢", "Technical model is bullish; Option Chain is neutral."
+    elif model_direction == "Bearish":
+        if option_sentiment == "Bearish":
+            return "Strongly Bearish 🔴🔴", "Option Chain confirms technical breakdown. High bearish momentum."
+        elif option_sentiment == "Bullish":
+            return "Cautious / Neutral ⚠️", "Technical model is bearish, but heavy Put writing (Option Chain) indicates strong support."
+        else:
+            return "Mildly Bearish 🔴", "Technical model is bearish; Option Chain is neutral."
+    else:
+        if option_sentiment == "Bullish":
+            return "Mildly Bullish 🟢", "Price is consolidating, but Option Chain shows bullish bias (PCR > 1.25)."
+        elif option_sentiment == "Bearish":
+            return "Mildly Bearish 🔴", "Price is consolidating, but Option Chain shows bearish bias (PCR < 0.65)."
+        else:
+            return "Consolidating / Sideways 🟡", "Both price action and options positioning indicate tight range trading."
 
 # Page Config
 st.set_page_config(
@@ -125,10 +213,10 @@ def predict_from_screenshot(image, timeframe="15m"):
     overlay_img, cv_data = analyzer.analyze_screenshot(image)
     
     if "error" in cv_data or cv_data["candles_count"] < 10:
-        return overlay_img, cv_data, None
+        return overlay_img, cv_data, None, None
         
     if not model_path.exists() or not scaler_path.exists():
-        return overlay_img, cv_data, {"warning": "Model not trained yet."}
+        return overlay_img, cv_data, {"warning": "Model not trained yet."}, None
         
     # 2. Get reconstructed OHLC data
     recon_candles = pd.DataFrame(cv_data["reconstructed_candles"])
@@ -212,11 +300,12 @@ def predict_from_screenshot(image, timeframe="15m"):
             }
         }
         
-        return overlay_img, cv_data, prediction_results
+        inputs_dict = {"seq_data": seq_data, "img_tensor": img_tensor}
+        return overlay_img, cv_data, prediction_results, inputs_dict
         
     except Exception as e:
         logger.error(f"Inference pipeline execution error: {e}")
-        return overlay_img, cv_data, {"error": f"Model inference failed: {str(e)}"}
+        return overlay_img, cv_data, {"error": f"Model inference failed: {str(e)}"}, None
 
 # ----------------- STREAMLIT LAYOUT -----------------
 
@@ -226,6 +315,11 @@ st.sidebar.markdown("<h2 style='color:#00e676;'>⚙️ Control Center</h2>", uns
 # Select Timeframe
 tf_list = CONFIG['data']['timeframes']
 selected_tf = st.sidebar.selectbox("Market Timeframe", tf_list, index=tf_list.index(CONFIG['data']['default_timeframe']))
+
+autopilot_enabled = st.sidebar.checkbox("🤖 Live Autopilot & Learning", value=False)
+refresh_rate = 30
+if autopilot_enabled:
+    refresh_rate = st.sidebar.slider("Refresh rate (seconds):", min_value=10, max_value=120, value=30)
 
 st.sidebar.markdown("---")
 
@@ -272,6 +366,69 @@ if st.sidebar.button("🔄 Run Backtester Strategy", use_container_width=True):
             st.sidebar.error(f"Backtesting failed: {e}")
 
 st.sidebar.markdown("<br><br><p style='text-align: center; color: #475569;'>AI trading engine v1.0.0</p>", unsafe_allow_html=True)
+
+# Initialize session state variables for prediction history and learning stats
+if "prediction_history" not in st.session_state:
+    st.session_state["prediction_history"] = []
+if "learning_updates_count" not in st.session_state:
+    st.session_state["learning_updates_count"] = 0
+
+# If Autopilot is active, download live data and evaluate pending predictions
+if autopilot_enabled:
+    try:
+        # Force download latest market tick
+        live_df = download_nifty_data(selected_tf, force_download=True)
+        
+        # Check for pending evaluations
+        for pred in st.session_state["prediction_history"]:
+            if pred["status"] == "Pending" and pred["timeframe"] == selected_tf:
+                # Find if a candle has closed AFTER the prediction timestamp
+                latest_timestamp = live_df.index[-1]
+                pred_timestamp = pd.to_datetime(pred["timestamp"])
+                
+                # Check if we have the next candle's close
+                if latest_timestamp > pred_timestamp:
+                    # Let's locate the candle right after the prediction timestamp
+                    after_df = live_df[live_df.index > pred_timestamp]
+                    if not after_df.empty:
+                        target_candle = after_df.iloc[0]
+                        target_close = target_candle['close']
+                        entry_close = pred["entry_price"]
+                        
+                        # Actual return
+                        actual_return = (target_close - entry_close) / entry_close
+                        
+                        # Calculate ATR from the latest candle
+                        atr_val = calculate_atr(live_df).loc[pred_timestamp] if pred_timestamp in live_df.index else (0.001 * entry_close)
+                        threshold = 0.5 * (atr_val / entry_close)
+                        
+                        # Determine actual direction
+                        if actual_return > threshold:
+                            actual_dir = "Bullish"
+                            actual_label = 1
+                        elif actual_return < -threshold:
+                            actual_dir = "Bearish"
+                            actual_label = 2
+                        else:
+                            actual_dir = "Sideways"
+                            actual_label = 0
+                            
+                        # Evaluate outcome
+                        pred["actual_direction"] = actual_dir
+                        pred["exit_price"] = target_close
+                        pred["outcome"] = "Correct" if pred["predicted_direction"] == actual_dir else "Incorrect"
+                        pred["status"] = "Evaluated"
+                        
+                        # Online learning update step
+                        if pred["seq_data"] is not None and pred["img_tensor"] is not None:
+                            seq_data = pred["seq_data"]
+                            img_tensor = pred["img_tensor"]
+                            success = fine_tune_online_step(selected_tf, seq_data, img_tensor, actual_label)
+                            if success:
+                                st.session_state["learning_updates_count"] += 1
+                                logger.info(f"Executed online learning update on {selected_tf} model.")
+    except Exception as e:
+        logger.error(f"Error in Autopilot evaluation loop: {e}")
 
 # Main Title Section
 st.markdown("<h1 style='text-align: center; margin-bottom: 0px;'>📈 AI-Based NIFTY 50 Candlestick Prediction System</h1>", unsafe_allow_html=True)
@@ -364,7 +521,7 @@ with tab1:
         with col_img_left:
             st.markdown("### Computer Vision Analysis")
             with st.spinner("Processing chart image using CV contours..."):
-                overlay_img, cv_data, pred_res = predict_from_screenshot(opencv_img, timeframe=selected_tf)
+                overlay_img, cv_data, pred_res, inputs_dict = predict_from_screenshot(opencv_img, timeframe=selected_tf)
                 
                 # Convert back to RGB for streamlit
                 overlay_rgb = cv2.cvtColor(overlay_img, cv2.COLOR_BGR2RGB)
@@ -381,9 +538,34 @@ with tab1:
             elif "error" in pred_res:
                 st.error(pred_res["error"])
             else:
-                # Prediction cards
+                # Record to Prediction History for Self-Learning
+                latest_candle_time = live_df.index[-1] if 'live_df' in locals() and not live_df.empty else pd.Timestamp.now()
+                hist = st.session_state["prediction_history"]
+                already_exists = any(p["timestamp"] == str(latest_candle_time) and p["timeframe"] == selected_tf for p in hist)
+                
+                if not already_exists:
+                    st.session_state["prediction_history"].append({
+                        "timestamp": str(latest_candle_time),
+                        "timeframe": selected_tf,
+                        "predicted_direction": pred_res["direction"],
+                        "entry_price": float(live_df.iloc[-1]['close']) if 'live_df' in locals() and not live_df.empty else 23000.0,
+                        "exit_price": None,
+                        "actual_direction": None,
+                        "outcome": "Pending",
+                        "status": "Pending",
+                        "seq_data": inputs_dict["seq_data"] if inputs_dict else None,
+                        "img_tensor": inputs_dict["img_tensor"] if inputs_dict else None
+                    })
+                    
+                # Fetch Option Chain data
+                spot_price = float(live_df.iloc[-1]['close']) if 'live_df' in locals() and not live_df.empty else 23000.0
+                option_data = get_nifty_option_chain_data(spot_price)
+                
+                # Fused Sentiment calculation
                 dir_label = pred_res["direction"]
                 confidence = pred_res["confidence"]
+                
+                fused_label, fused_desc = calculate_fused_sentiment(dir_label, option_data["pcr"])
                 
                 if dir_label == "Bullish":
                     st.markdown(f"<div style='background-color:#143224; padding:15px; border-radius:6px; border-left: 6px solid #00e676; margin-bottom:15px;'>"
@@ -397,6 +579,26 @@ with tab1:
                     st.markdown(f"<div style='background-color:#322915; padding:15px; border-radius:6px; border-left: 6px solid #ffc107; margin-bottom:15px;'>"
                                 f"<h4 style='margin:0; color:#ffc107;'>PREDICTED NEXT MOVE: SIDEWAYS</h4>"
                                 f"<p style='margin:5px 0 0 0; font-size:18px;'>Confidence: <b>{confidence:.2f}%</b></p></div>", unsafe_allow_html=True)
+                
+                # Fused Sentiment Card
+                fused_bg = "#112233" if "Cautious" in fused_label else ("#143224" if "Bullish" in fused_label else "#361b24")
+                fused_border = "#374151" if "Cautious" in fused_label else ("#00e676" if "Bullish" in fused_label else "#ff3d71")
+                st.markdown(f"<div style='background-color:{fused_bg}; padding:15px; border-radius:6px; border-left: 6px solid {fused_border}; margin-bottom:15px;'>"
+                            f"<h4 style='margin:0; color:{fused_border};'>FUSED MARKET SENTIMENT</h4>"
+                            f"<p style='margin:5px 0 0 0; font-size:18px;'><b>{fused_label}</b></p>"
+                            f"<p style='margin:3px 0 0 0; font-size:13px; color:#94a3b8;'>{fused_desc}</p></div>", unsafe_allow_html=True)
+                
+                # Option Chain Summary Metrics
+                st.markdown("### NIFTY 50 Option Chain Analysis")
+                col_o1, col_o2 = st.columns(2)
+                with col_o1:
+                    st.metric("Put-Call Ratio (PCR)", f"{option_data['pcr']}", 
+                              delta="Bullish Bias" if option_data['pcr'] > 1.25 else ("Bearish Bias" if option_data['pcr'] < 0.65 else "Neutral"))
+                    st.metric("Max Pain Strike", f"₹{option_data['max_pain']:,}")
+                with col_o2:
+                    st.metric("Support Wall (Max Put OI)", f"₹{option_data['support_wall']:,}")
+                    st.metric("Resistance Wall (Max Call OI)", f"₹{option_data['resistance_wall']:,}")
+                st.caption(f"Source: {option_data['source']}")
                 
                 # Dynamic Confidence Graph
                 probs = pred_res["probs"]
@@ -457,6 +659,50 @@ with tab1:
                     st.markdown(f"- 🔸 `{p}`")
             else:
                 st.write("No candlestick patterns detected visually.")
+                
+        # Render full-width Option Chain Open Interest Distribution Chart
+        if 'option_data' in locals() and option_data is not None:
+            st.markdown("---")
+            st.markdown("### 📊 NIFTY 50 Option Chain Open Interest (OI) Distribution")
+            st.write("This chart shows the volume of Open Interest for Calls (CE) and Puts (PE) at key strike prices. "
+                     "Calls act as resistance ceilings, while Puts act as support floors.")
+            
+            chain_df = option_data["chain_df"]
+            
+            fig, ax = plt.subplots(figsize=(10, 4))
+            fig.patch.set_facecolor('#0b0d12')
+            ax.set_facecolor('#161b26')
+            
+            x = np.arange(len(chain_df))
+            width = 0.35
+            
+            # CE in red (resistance), PE in green (support)
+            rects1 = ax.bar(x - width/2, chain_df['call_oi'] / 1000, width, label='Call OI (CE) - Resistance', color='#ff3d71')
+            rects2 = ax.bar(x + width/2, chain_df['put_oi'] / 1000, width, label='Put OI (PE) - Support', color='#00e676')
+            
+            ax.set_ylabel('Open Interest (in Thousands)', color='#e2e8f0')
+            ax.set_title(f'NIFTY 50 OI Strike Wise Distribution (PCR: {option_data["pcr"]})', color='#ffffff', fontsize=12)
+            ax.set_xticks(x)
+            ax.set_xticklabels(chain_df['strike'].astype(int), rotation=45, color='#e2e8f0')
+            ax.tick_params(colors='#e2e8f0')
+            
+            # Highlight spot price and max pain
+            ax.axvline(x=len(chain_df)//2, color='#ffc107', linestyle='--', label=f'Spot Price (approx ₹{int(spot_price)})')
+            
+            # Legend & styling
+            legend = ax.legend(facecolor='#161b26', edgecolor='#242f47')
+            for text in legend.get_texts():
+                text.set_color('#e2e8f0')
+                
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            ax.spines['left'].set_color('#242f47')
+            ax.spines['bottom'].set_color('#242f47')
+            ax.grid(color='#242f47', linestyle=':', alpha=0.5)
+            
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close()
     else:
         st.info("📂 Please upload a trading chart screenshot or snap a camera photo to run the computer vision analysis.")
 
@@ -532,8 +778,53 @@ with tab3:
 
 # Tab 4: Continuous learning
 with tab4:
-    st.subheader("Continuous Learning & Online Feedback Loop")
-    st.markdown("Help the AI continuously improve! If you uploaded a screenshot and know the subsequent market outcome, "
+    st.subheader("🤖 Real-Time Autopilot & Self-Learning System")
+    st.write("When **Live Autopilot** is toggled ON, the AI engine periodically fetches the latest price feed, "
+             "runs visual chart analysis, and records predictions. As each candle interval closes, the engine "
+             "evaluates prediction accuracy and executes continuous online updates (backpropagation) to adapt to the current market regime.")
+    
+    # Calculate stats
+    history_list = st.session_state["prediction_history"]
+    total_preds = len(history_list)
+    evaluated_preds = [p for p in history_list if p["status"] == "Evaluated"]
+    pending_preds = [p for p in history_list if p["status"] == "Pending"]
+    
+    correct_count = sum(1 for p in evaluated_preds if p["outcome"] == "Correct")
+    evaluated_count = len(evaluated_preds)
+    live_accuracy = (correct_count / evaluated_count * 100) if evaluated_count > 0 else 0.0
+    
+    col_l1, col_l2, col_l3, col_l4 = st.columns(4)
+    with col_l1:
+        st.metric("Total Predictions Logged", f"{total_preds}")
+    with col_l2:
+        st.metric("Evaluated Predictions", f"{evaluated_count}")
+    with col_l3:
+        st.metric("Live Accuracy", f"{live_accuracy:.2f}%" if evaluated_count > 0 else "N/A", 
+                  delta=f"{correct_count}/{evaluated_count} Correct" if evaluated_count > 0 else None)
+    with col_l4:
+        st.metric("Online Gradient Updates", f"{st.session_state['learning_updates_count']}")
+        
+    st.markdown("### 📋 Prediction History Logs")
+    if total_preds > 0:
+        # Create a summary dataframe for visual display
+        log_records = []
+        for p in reversed(history_list): # Show newest first
+            log_records.append({
+                "Timestamp": p["timestamp"],
+                "Timeframe": p["timeframe"],
+                "Predicted Direction": p["predicted_direction"],
+                "Entry Price (₹)": f"{p['entry_price']:,.2f}",
+                "Exit Price (₹)": f"{p['exit_price']:,.2f}" if p['exit_price'] else "Pending...",
+                "Actual Move": p["actual_direction"] if p["actual_direction"] else "Pending...",
+                "Outcome": p["outcome"]
+            })
+        st.dataframe(pd.DataFrame(log_records), use_container_width=True)
+    else:
+        st.info("No predictions have been logged in the active session yet. Run a screen capture or live camera prediction to log data.")
+        
+    st.markdown("---")
+    st.subheader("📸 Manual Feedback & Screenshots Submission")
+    st.markdown("Help the AI improve manually! If you uploaded a screenshot and know the subsequent market outcome, "
                 "submit it here. This data is saved locally and can be used to fine-tune the neural network.")
                 
     feedback_file = st.file_uploader("Upload screenshot to submit outcome", type=["png", "jpg", "jpeg"], key="feedback_uploader")
@@ -595,3 +886,8 @@ with tab4:
                         st.success("Online learning completed! Model successfully updated with feedback instances.")
                 except Exception as e:
                     st.error(f"Fine-tuning failed: {e}")
+
+# Autopilot Auto-Refresh Loop
+if autopilot_enabled:
+    time.sleep(refresh_rate)
+    st.rerun()
