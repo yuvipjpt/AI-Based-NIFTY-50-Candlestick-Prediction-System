@@ -309,13 +309,23 @@ tab1, tab2, tab3, tab4 = st.tabs([
 
 # Tab 1: Prediction
 with tab1:
-    st.subheader("Upload Screenshot")
-    uploaded_file = st.file_uploader("Upload a NIFTY 50 trading chart screenshot (PNG or JPG)", type=["png", "jpg", "jpeg"])
+    st.subheader("Live Chart Input")
+    input_method = st.radio("Choose Input Method:", ["Upload Screenshot", "Live Camera / Webcam"], horizontal=True)
     
-    if uploaded_file is not None:
-        file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-        opencv_img = cv2.imdecode(file_bytes, 1)
-        
+    opencv_img = None
+    
+    if input_method == "Upload Screenshot":
+        uploaded_file = st.file_uploader("Upload a NIFTY 50 trading chart screenshot (PNG or JPG)", type=["png", "jpg", "jpeg"])
+        if uploaded_file is not None:
+            file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+            opencv_img = cv2.imdecode(file_bytes, 1)
+    else:
+        camera_file = st.camera_input("Snap a picture of your trading screen")
+        if camera_file is not None:
+            file_bytes = np.asarray(bytearray(camera_file.read()), dtype=np.uint8)
+            opencv_img = cv2.imdecode(file_bytes, 1)
+            
+    if opencv_img is not None:
         col_img_left, col_results_right = st.columns([3, 2])
         
         with col_img_left:
@@ -415,7 +425,7 @@ with tab1:
             else:
                 st.write("No candlestick patterns detected visually.")
     else:
-        st.info("📂 Please upload a trading chart screenshot to run the computer vision analysis.")
+        st.info("📂 Please upload a trading chart screenshot or snap a camera photo to run the computer vision analysis.")
 
 # Tab 2: Evaluation
 with tab2:
