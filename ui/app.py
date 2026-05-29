@@ -5,7 +5,8 @@ import torch
 import numpy as np
 import pandas as pd
 import cv2
-from PIL import Image
+from PIL import Image, ImageGrab
+import time
 import streamlit as st
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -310,20 +311,52 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # Tab 1: Prediction
 with tab1:
     st.subheader("Live Chart Input")
-    input_method = st.radio("Choose Input Method:", ["Upload Screenshot", "Live Camera / Webcam"], horizontal=True)
+    input_method = st.radio("Choose Input Method:", ["Upload Screenshot", "Live Camera / Webcam", "🖥️ Screen Capture (Auto-Detect)"], horizontal=True)
     
+    # Initialize session state for screen capture image if not present
+    if "captured_image" not in st.session_state:
+        st.session_state["captured_image"] = None
+        
     opencv_img = None
     
     if input_method == "Upload Screenshot":
+        st.session_state["captured_image"] = None
         uploaded_file = st.file_uploader("Upload a NIFTY 50 trading chart screenshot (PNG or JPG)", type=["png", "jpg", "jpeg"])
         if uploaded_file is not None:
             file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
             opencv_img = cv2.imdecode(file_bytes, 1)
-    else:
+    elif input_method == "Live Camera / Webcam":
+        st.session_state["captured_image"] = None
         camera_file = st.camera_input("Snap a picture of your trading screen")
         if camera_file is not None:
             file_bytes = np.asarray(bytearray(camera_file.read()), dtype=np.uint8)
             opencv_img = cv2.imdecode(file_bytes, 1)
+    else:
+        st.markdown("### 🖥️ Screen Capture Mode")
+        st.write("Open your TradingView or broker window with the chart on your screen, then click the button below. "
+                 "The system will wait for a short delay to allow you to focus/bring the chart window to the front, "
+                 "take a screenshot of your screen, and automatically crop and predict the chart's next move!")
+        
+        delay_sec = st.slider("Delay before capture (seconds):", min_value=1, max_value=10, value=3)
+        
+        if st.button("📸 Capture Screen Now", use_container_width=True):
+            status_placeholder = st.empty()
+            for i in range(delay_sec, 0, -1):
+                status_placeholder.warning(f"🖥️ Switch to your chart window now! Capturing in {i} seconds...")
+                time.sleep(1)
+            status_placeholder.success("📸 Capturing screen...")
+            time.sleep(0.2)
+            
+            try:
+                pil_img = ImageGrab.grab()
+                img_np = np.array(pil_img)
+                st.session_state["captured_image"] = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+                status_placeholder.empty()
+            except Exception as e:
+                st.error(f"Failed to capture screen: {e}")
+                
+        if st.session_state["captured_image"] is not None:
+            opencv_img = st.session_state["captured_image"]
             
     if opencv_img is not None:
         col_img_left, col_results_right = st.columns([3, 2])
